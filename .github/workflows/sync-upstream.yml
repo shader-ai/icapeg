@@ -1,0 +1,58 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout urai-patches
+        uses: actions/checkout@v4
+        with:
+          ref: urai-patches
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/egirna/icapeg.git || true
+          git fetch upstream master
+
+      - name: Attempt rebase
+        id: rebase
+        continue-on-error: true
+        run: |
+          git rebase upstream/master
+
+      - name: Push rebased branch
+        if: steps.rebase.outcome == 'success'
+        run: |
+          git push --force-with-lease origin urai-patches
+
+      - name: Open PR on conflict
+        if: steps.rebase.outcome == 'failure'
+        run: |
+          git rebase --abort
+          git checkout -b sync/upstream-$(date +%Y%m%d)
+          git merge upstream/master --no-edit || true
+          git add -A
+          git commit -m "chore: merge upstream master (conflicts need manual resolution)" --allow-empty
+          git push -u origin sync/upstream-$(date +%Y%m%d)
+          gh pr create \
+            --title "chore: sync upstream (conflicts)" \
+            --body "Automated upstream sync failed to rebase cleanly. Please resolve conflicts manually." \
+            --base urai-patches \
+            --head sync/upstream-$(date +%Y%m%d)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
