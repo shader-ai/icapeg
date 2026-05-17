@@ -20,6 +20,9 @@ func (e *Echo) Processing(partial bool, IcapHeader textproto.MIMEHeader) (int, i
 	msgHeadersBeforeProcessing := e.generalFunc.LogHTTPMsgHeaders(e.methodName)
 	msgHeadersAfterProcessing := make(map[string]interface{})
 	vendorMsgs := make(map[string]interface{})
+	logging.Logger.Info(utils.PrepareLogMsg(e.xICAPMetadata,
+		fmt.Sprintf("DEBUG echo.Processing ENTRY: partial=%v, serviceName=%s, methodName=%s",
+			partial, e.serviceName, e.methodName)))
 	logging.Logger.Info(utils.PrepareLogMsg(e.xICAPMetadata, e.serviceName+" service has started processing"))
 
 	// no need to scan part of the file, this service needs all the file at ine time
