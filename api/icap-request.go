@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"icapeg/business"
 	"icapeg/config"
 	utils "icapeg/consts"
 	http_message "icapeg/http-message"
@@ -17,6 +19,26 @@ import (
 	"strconv"
 	"strings"
 )
+
+// httpMessageHasBody checks if the encapsulated HTTP message has body content.
+// Per RFC 3507 Section 4.4.1, null-body must be used when no body is present.
+func httpMessageHasBody(httpMsg interface{}) bool {
+	switch msg := httpMsg.(type) {
+	case *http.Request:
+		cl := msg.Header.Get("Content-Length")
+		if cl == "" || cl == "0" {
+			return false
+		}
+		return true
+	case *http.Response:
+		cl := msg.Header.Get("Content-Length")
+		if cl == "" || cl == "0" {
+			return false
+		}
+		return true
+	}
+	return false
+}
 
 // ICAPRequest struct is used to encapsulate important information of the ICAP request like method name, etc
 type ICAPRequest struct {
@@ -33,6 +55,8 @@ type ICAPRequest struct {
 	optionsRespHeaders     map[string]interface{}
 	generalReqHeaders      map[string]interface{}
 	generalRespHeaders     map[string]interface{}
+	businessLogicApplied   bool // validation + first-pass policy (SQS may be deferred until full body)
+	pendingRecording       bool // record action deferred because body was ICAP preview-only; flush on second pass
 }
 
 // NewICAPRequest is a func to create a new instance from struct IcapRequest yo handle upcoming ICAP requests
@@ -160,6 +184,9 @@ func (i *ICAPRequest) RequestProcessing(xICAPMetadata string) {
 			partial = true
 		}
 	}
+	logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata,
+		fmt.Sprintf("DEBUG partial flag AFTER computation: partial=%v, fileLen=%d, endIndicator=%q",
+			partial, 0, i.req.EndIndicator)))
 
 	i.HostHeader()
 
@@ -195,6 +222,9 @@ func (i *ICAPRequest) HostHeader() {
 }
 
 func (i *ICAPRequest) RespAndReqMods(partial bool, xICAPMetadata string) {
+	logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata,
+		fmt.Sprintf("DEBUG RespAndReqMods ENTRY: partial=%v, businessLogicApplied=%v, method=%s, endIndicator=%q, previewHeader=%q",
+			partial, i.businessLogicApplied, i.methodName, i.req.EndIndicator, i.req.Header.Get("Preview"))))
 
 	if i.methodName == utils.ICAPModeReq {
 		defer i.req.Request.Body.Close()
@@ -211,6 +241,44 @@ func (i *ICAPRequest) RespAndReqMods(partial bool, xICAPMetadata string) {
 	if i.req.Request == nil {
 		i.req.Request = &http.Request{}
 	}
+
+	// Apply business logic (tenant validation, URL matching, SQS) before service processing.
+	// Run only once per ICAP request to avoid duplicate SQS enqueue when service returns 100 Continue (RespAndReqMods is called again).
+	if !i.businessLogicApplied {
+		i.businessLogicApplied = true
+		businessHandler := business.GetHandler()
+		if businessHandler != nil && i.methodName == utils.ICAPModeReq {
+			logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, "applying business logic (tenant validation, URL matching)"))
+			statusCode, deferRecording, err := businessHandler.ProcessRequest(i.req.Header, i.req.Request, i.methodName, xICAPMetadata, partial)
+			i.pendingRecording = deferRecording
+			if err != nil {
+				logging.Logger.Warn(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("Business logic error: %v", err)))
+				// Continue processing even if business logic fails
+			}
+			if statusCode == utils.BadRequestStatusCodeStr {
+				// Validation failed - return error
+				i.w.WriteHeader(statusCode, nil, false)
+				return
+			}
+			// If statusCode is NoModificationStatusCodeStr, continue with normal processing
+		}
+	} else if i.pendingRecording && !partial && i.methodName == utils.ICAPModeReq {
+		businessHandler := business.GetHandler()
+		if businessHandler != nil {
+			logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata,
+				"ICAP RECORD FLUSH: full body available after preview — enqueueing deferred recording"))
+			statusCode, _, err := businessHandler.ProcessRequest(i.req.Header, i.req.Request, i.methodName, xICAPMetadata, false)
+			i.pendingRecording = false
+			if err != nil {
+				logging.Logger.Warn(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("Business logic error (deferred recording): %v", err)))
+			}
+			if statusCode == utils.BadRequestStatusCodeStr {
+				i.w.WriteHeader(statusCode, nil, false)
+				return
+			}
+		}
+	}
+
 	//initialize the service by creating instance from the required service
 	logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata,
 		"initialize the service by creating instance from the required service"))
@@ -226,6 +294,9 @@ func (i *ICAPRequest) RespAndReqMods(partial bool, xICAPMetadata string) {
 	//icap.Request.Response
 	IcapStatusCode, httpMsg, serviceHeaders, httpMshHeadersBeforeProcessing, httpMshHeadersAfterProcessing,
 		vendorMsgs := requiredService.Processing(partial, i.req.Header)
+	logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata,
+		fmt.Sprintf("DEBUG service Processing returned: IcapStatusCode=%d, partial=%v, httpMsg_is_nil=%v",
+			IcapStatusCode, partial, httpMsg == nil)))
 
 	// adding the headers which the service wants to add them in the ICAP response
 	logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata,
@@ -253,11 +324,17 @@ func (i *ICAPRequest) RespAndReqMods(partial bool, xICAPMetadata string) {
 			i.serviceName+" returned ICAP response with status code "+strconv.Itoa(utils.InternalServerErrStatusCodeStr)))
 		i.w.WriteHeader(IcapStatusCode, nil, false)
 	case utils.Continue:
+		logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata,
+			fmt.Sprintf("DEBUG 100 CONTINUE path: serviceName=%s, endIndicator=%q",
+				i.serviceName, i.req.EndIndicator)))
 		logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata,
 			i.serviceName+" returned ICAP response with status code "+strconv.Itoa(utils.Continue)))
 		//in case the service returned 100 continue
 		//we will get the rest of the body from the client
 		httpMsgBody := i.preview(xICAPMetadata)
+		logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata,
+			fmt.Sprintf("DEBUG preview body received: bodyLen=%d bytes, endIndicator_after_preview=%q",
+				httpMsgBody.Len(), i.req.EndIndicator)))
 		i.methodName = i.req.Method
 		if i.req.Method == utils.ICAPModeReq {
 			i.req.Request.Body = io.NopCloser(bytes.NewBuffer(httpMsgBody.Bytes()))
@@ -267,6 +344,9 @@ func (i *ICAPRequest) RespAndReqMods(partial bool, xICAPMetadata string) {
 		}
 		i.allHeaders(IcapStatusCode, httpMshHeadersBeforeProcessing, httpMshHeadersAfterProcessing, vendorMsgs,
 			xICAPMetadata)
+		logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata,
+			fmt.Sprintf("DEBUG about to RECURSIVE call RespAndReqMods(partial=false): endIndicator=%q, previewHeader=%q",
+				i.req.EndIndicator, i.req.Header.Get("Preview"))))
 		i.RespAndReqMods(false, xICAPMetadata)
 	case utils.RequestTimeOutStatusCodeStr:
 		logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata,
@@ -286,10 +366,10 @@ func (i *ICAPRequest) RespAndReqMods(partial bool, xICAPMetadata string) {
 				i.req.Request.Body = io.NopCloser(bytes.NewBuffer(body))
 				i.req.Request.Header.Set(utils.ContentLength, strconv.Itoa(len(body)))
 				defer i.req.Request.Body.Close()
-				i.w.WriteHeader(utils.OkStatusCodeStr, i.req.Request, true)
+				i.w.WriteHeader(utils.OkStatusCodeStr, i.req.Request, httpMessageHasBody(i.req.Request))
 			} else {
 				IcapStatusCode = utils.OkStatusCodeStr
-				i.w.WriteHeader(utils.OkStatusCodeStr, httpMsg, true)
+				i.w.WriteHeader(utils.OkStatusCodeStr, httpMsg, httpMessageHasBody(httpMsg))
 			}
 
 			//i.w.WriteHeader(utils.OkStatusCodeStr, httpMsg, true)
@@ -297,11 +377,11 @@ func (i *ICAPRequest) RespAndReqMods(partial bool, xICAPMetadata string) {
 	case utils.OkStatusCodeStr:
 		logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata,
 			i.serviceName+" returned ICAP response with status code "+strconv.Itoa(utils.OkStatusCodeStr)))
-		i.w.WriteHeader(utils.OkStatusCodeStr, httpMsg, true)
+		i.w.WriteHeader(utils.OkStatusCodeStr, httpMsg, httpMessageHasBody(httpMsg))
 	case utils.BadRequestStatusCodeStr:
 		logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata,
 			i.serviceName+" returned ICAP response with status code "+strconv.Itoa(utils.BadRequestStatusCodeStr)))
-		i.w.WriteHeader(IcapStatusCode, httpMsg, true)
+		i.w.WriteHeader(IcapStatusCode, httpMsg, httpMessageHasBody(httpMsg))
 	}
 	i.allHeaders(IcapStatusCode, httpMshHeadersBeforeProcessing, httpMshHeadersAfterProcessing, vendorMsgs, xICAPMetadata)
 }
@@ -495,7 +575,7 @@ func (i *ICAPRequest) preview(xICAPMetadata string) *bytes.Buffer {
 	logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata,
 		"getting the rest of the body from client after the service returned ICAP "+
 			"response with status code"+strconv.Itoa(utils.Continue)))
-	r := icap.GetTheRest()
+	r := i.req.GetTheRest()
 	c := io.NopCloser(r)
 	buf := new(bytes.Buffer)
 	buf.ReadFrom(c)

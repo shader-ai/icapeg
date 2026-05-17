@@ -42,10 +42,12 @@ type Request struct {
 	// The HTTP messages.
 	Request  *http.Request
 	Response *http.Response
+	// Per-request state for preview/100-continue handling.
+	// These must NOT be package-level globals to avoid race conditions
+	// when multiple connections are processed concurrently.
+	origBuf    *bufio.ReadWriter
+	origReader io.Reader
 }
-
-var origBuf *bufio.ReadWriter
-var origReader io.Reader
 
 // ReadRequest reads and parses a request from b.
 func ReadRequest(b *bufio.ReadWriter) (req *Request, err error) {
@@ -151,8 +153,8 @@ func ReadRequest(b *bufio.ReadWriter) (req *Request, err error) {
 		if p := req.Header.Get("Preview"); p != "" {
 
 			req.Preview, err = ioutil.ReadAll(newChunkedReader(b))
-			origBuf = b
-			origReader = bytes.NewBuffer(req.Preview)
+			req.origBuf = b
+			req.origReader = bytes.NewBuffer(req.Preview)
 			req.EndIndicator = "0"
 			if err != nil {
 				if strings.Contains(err.Error(), "ieof") {
@@ -257,6 +259,6 @@ func (c *continueReader) Read(p []byte) (n int, err error) {
 	return c.cr.Read(p)
 }
 
-func GetTheRest() io.Reader {
-	return io.MultiReader(origReader, &continueReader{buf: origBuf})
+func (req *Request) GetTheRest() io.Reader {
+	return io.MultiReader(req.origReader, &continueReader{buf: req.origBuf})
 }
