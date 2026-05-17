@@ -20,11 +20,28 @@ title = "ICAP configuration file"
 [app]
 port = 1344
 log_level="debug"
-write_logs_to_console= false
-services= ["echo", "clhashlookup", "clamav"]
+write_logs_to_console= true
+services= ["reqmod", "echo", "clhashlookup", "clamav"]
 debugging_headers=true
 web_server_host = "$_WEB_SERVER_HOST" #Example: "localhost:8081" , replace localhost with the ICAP server IP address.
 web_server_endpoint = "/service/message"  
+
+# reqmod: used by G3 proxy (icap://host:1344/reqmod). Echo/pass-through + business logic (tenant, URL match, SQS).
+[reqmod]
+vendor = "echo"
+service_caption = "REQMOD (Urai business logic)"
+service_tag = "REQMOD ICAP"
+req_mode = true
+resp_mode = false
+shadow_service = false
+preview_bytes = "1024"
+preview_enabled = true
+process_extensions = ["*"]
+reject_extensions = []
+bypass_extensions = []
+max_filesize = 0
+return_original_if_max_file_size_exceeded = false
+return_400_if_file_ext_rejected = false
 
 [echo]
 vendor = "echo"

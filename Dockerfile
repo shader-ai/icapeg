@@ -1,7 +1,8 @@
 FROM golang:alpine AS Builder
+ARG TARGETARCH
 WORKDIR /home/icapeg
 COPY . .
-RUN go build .
+RUN GOARCH=${TARGETARCH} go build .
 
 FROM alpine
 WORKDIR /home/icapeg

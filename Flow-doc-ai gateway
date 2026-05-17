@@ -1,0 +1,47 @@
+                        +--------------------------------------+
+                        |      URAI Control Plane (Backend)    |
+                        |--------------------------------------|
+                        | - Tenant onboarding                  |
+                        | - Provider key management            |
+                        | - Policy authoring/versioning        |
+                        | - Analytics & governance dashboard   |
+                        +------------------+-------------------+
+                                           ^
+                                           | (async export: telemetry/audit)
+                                           |
++-------------------+      request         |        +--------------------------+
+| Tenant App/Agent  | ---------------------+------> |   URAI Gateway (Data     |
+| (uses tenant key) |                              |   Plane / Runtime Path)   |
++-------------------+                              |--------------------------|
+                                                   | 1) Auth + tenant resolve  |
+                                                   | 2) Load cached policy     |
+                                                   | 3) Governance engine      |
+                                                   |    - monitor/redact/block |
+                                                   | 4) Forward to provider hop|
+                                                   +------------+--------------+
+                                                                |
+                                                                | provider call
+                                                                v
+                                                   +---------------------------+
+                                                   |   MLflow AI Gateway       |
+                                                   | (optional internal router)|
+                                                   +------------+--------------+
+                                                                |
+                                                                v
+                                                   +---------------------------+
+                                                   | LLM Provider(s)           |
+                                                   | OpenAI/Anthropic/etc.     |
+                                                   +------------+--------------+
+                                                                |
+                                                                | response
+                                                                v
+                                                   +---------------------------+
+                                                   | URAI Gateway              |
+                                                   | - response governance     |
+                                                   | - return to client        |
+                                                   +------------+--------------+
+                                                                |
+                                                                v
+                                                     +-----------------------+
+                                                     | Tenant App/Agent      |
+                                                     +-----------------------+

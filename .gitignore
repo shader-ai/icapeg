@@ -28,4 +28,5 @@ logs
 
 # Env file
 app.env
+.env
 .vscode
