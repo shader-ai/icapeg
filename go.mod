@@ -1,11 +1,15 @@
 module icapeg
 
-go 1.19
+go 1.21
 
 require (
+	github.com/aws/aws-sdk-go v1.55.8
 	github.com/davecgh/go-spew v1.1.1
 	github.com/dutchcoders/go-clamd v0.0.0-20170520113014-b970184f4d9e
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/h2non/filetype v1.0.12
+	github.com/joho/godotenv v1.5.1
+	github.com/lib/pq v1.11.2
 	github.com/spf13/viper v1.9.0
 	github.com/xhit/go-str2duration/v2 v2.0.0
 	go.uber.org/zap v1.22.0
@@ -14,6 +18,7 @@ require (
 require (
 	github.com/fsnotify/fsnotify v1.5.1 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
+	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/magiconair/properties v1.8.5 // indirect
 	github.com/mitchellh/mapstructure v1.4.2 // indirect
 	github.com/pelletier/go-toml v1.9.4 // indirect
