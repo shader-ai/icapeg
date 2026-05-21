@@ -55,7 +55,7 @@ type RecordingRequest struct {
 	SessionID      string            `json:"session_id,omitempty"`
 	SourceIP       string            `json:"source_ip,omitempty"`
 	ToolID         string            `json:"tool_id,omitempty"`
-	IsToolApproved *bool             `json:"is_tool_approved,omitempty"`
+	IsToolSanctioned *bool           `json:"is_tool_sanctioned,omitempty"`
 	EndpointID     string            `json:"endpoint_id,omitempty"`
 	ContentPaths   json.RawMessage   `json:"content_paths,omitempty"`
 	Timestamp      string            `json:"timestamp"`

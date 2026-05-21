@@ -61,7 +61,7 @@ type URLConfig struct {
 	Paths          []string
 	ID             string // endpoint_id
 	ToolID         string // ai_tools.tool_id (UUID) so recording worker can associate request with tool
-	IsToolApproved *bool  // tenant_ai_tools.is_approved at request time (nil if no row = default false)
+	IsToolSanctioned *bool // tenant_ai_tools.is_sanctioned at request time (nil if no row = default false)
 	ContentPaths   []byte // JSON for prompt extraction in recording worker; nil if NULL
 }
 
@@ -142,21 +142,21 @@ func (um *URLMatcher) RefreshEndpointsCache() {
 	logging.Logger.Info(fmt.Sprintf("ICAP ENDPOINT CACHE: loaded %d endpoints for %d base URLs", total, len(newCache)))
 }
 
-// tenantToolFlags returns is_monitored and is_approved for (tenant_id, tool_id).
-// No row in tenant_ai_tools means default: monitored=true, approved=false.
-func (um *URLMatcher) tenantToolFlags(ctx context.Context, tenantID, toolID string) (isMonitored bool, isApproved *bool, err error) {
-	var monitored, approved bool
+// tenantToolSanctioned returns is_sanctioned for (tenant_id, tool_id).
+// No row in tenant_ai_tools means default: unsanctioned (false).
+func (um *URLMatcher) tenantToolSanctioned(ctx context.Context, tenantID, toolID string) (*bool, error) {
+	var sanctioned bool
 	rowErr := um.db.QueryRowContext(ctx,
-		`SELECT is_monitored, is_approved FROM tenant_ai_tools WHERE tenant_id = $1 AND tool_id = $2`,
+		`SELECT is_sanctioned FROM tenant_ai_tools WHERE tenant_id = $1 AND tool_id = $2`,
 		tenantID, toolID,
-	).Scan(&monitored, &approved)
+	).Scan(&sanctioned)
 	if rowErr == sql.ErrNoRows {
-		return true, nil, nil // default: monitor=true, approved=nil (record as "unknown/default" or false per backend default)
+		return nil, nil
 	}
 	if rowErr != nil {
-		return false, nil, rowErr
+		return nil, rowErr
 	}
-	return monitored, &approved, nil
+	return &sanctioned, nil
 }
 
 // pathSegmentMatch returns true if requestPath matches configuredPath.
@@ -320,28 +320,23 @@ func (um *URLMatcher) MatchURL(requestURL, tenantID, httpMethod string) (*URLCon
 		return nil, nil
 	}
 
-	// Single DB lookup: is this tenant monitoring this tool and get approval status for audit
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	monitored, isApproved, err := um.tenantToolFlags(ctx, tenantID, matched.ToolID)
+	isSanctioned, err := um.tenantToolSanctioned(ctx, tenantID, matched.ToolID)
 	if err != nil {
 		logging.Logger.Error(fmt.Sprintf("Error checking tenant_ai_tools: %v", err))
 		return nil, err
 	}
-	if !monitored {
-		logging.Logger.Info(fmt.Sprintf("ICAP TENANT OPT-OUT: tenant='%s' tool_id='%s' is_monitored=false", tenantID, matched.ToolID))
-		return nil, nil
-	}
 
-	logging.Logger.Info(fmt.Sprintf("ICAP URL MATCH FOUND: '%s' -> rule='%s' (action=%s, flow=%s, tool_id=%s, is_approved=%v)", requestURL, matched.Name, matched.Action, matched.Flow, matched.ToolID, isApproved))
+	logging.Logger.Info(fmt.Sprintf("ICAP URL MATCH FOUND: '%s' -> rule='%s' (action=%s, flow=%s, tool_id=%s, is_sanctioned=%v)", requestURL, matched.Name, matched.Action, matched.Flow, matched.ToolID, isSanctioned))
 	return &URLConfig{
-		Name:           matched.Name,
-		Action:         matched.Action,
-		Flow:           matched.Flow,
-		Paths:          matched.Paths,
-		ID:             matched.EndpointID,
-		ToolID:         matched.ToolID,
-		IsToolApproved: isApproved,
-		ContentPaths:   append([]byte(nil), matched.ContentPaths...),
+		Name:             matched.Name,
+		Action:           matched.Action,
+		Flow:             matched.Flow,
+		Paths:            matched.Paths,
+		ID:               matched.EndpointID,
+		ToolID:           matched.ToolID,
+		IsToolSanctioned: isSanctioned,
+		ContentPaths:     append([]byte(nil), matched.ContentPaths...),
 	}, nil
 }

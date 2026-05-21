@@ -235,7 +235,7 @@ func (blh *BusinessLogicHandler) processRecordAction(
 		SessionID:      sessionID,
 		SourceIP:       identity.SourceIP,
 		ToolID:         urlConfig.ToolID,
-		IsToolApproved: urlConfig.IsToolApproved,
+		IsToolSanctioned: urlConfig.IsToolSanctioned,
 		EndpointID:     urlConfig.ID,
 		Timestamp:      time.Now().UTC().Format(time.RFC3339),
 	}

@@ -1,4 +1,4 @@
-FROM golang:alpine AS Builder
+FROM --platform=$BUILDPLATFORM golang:alpine AS Builder
 ARG TARGETARCH
 WORKDIR /home/icapeg
 COPY . .
