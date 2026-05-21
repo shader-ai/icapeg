@@ -151,8 +151,22 @@ func (blh *BusinessLogicHandler) ProcessRequest(
 					requestURL)))
 				return utils.NoModificationStatusCodeStr, true, nil
 			}
+			// Snapshot body bytes synchronously before launching goroutine.
+			// requiredService.Processing() will later exhaust httpRequest.Body via
+			// CopyingFileToTheBuffer; capturing here avoids the race where the goroutine
+			// reads an empty body.
+			var bodySnapshot []byte
+			if httpRequest != nil && httpRequest.Body != nil {
+				var snapErr error
+				bodySnapshot, snapErr = io.ReadAll(httpRequest.Body)
+				if snapErr != nil {
+					logging.Logger.Warn(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("ICAP BODY SNAPSHOT ERROR: %v", snapErr)))
+				}
+				// Restore body so the downstream ICAP service can still read it.
+				httpRequest.Body = io.NopCloser(bytes.NewBuffer(bodySnapshot))
+			}
 			logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("ICAP RECORD ACTION: Starting background processing for URL '%s' (action=%s, flow=%s)", requestURL, action, flow)))
-			go blh.processRecordAction(httpRequest, identity, urlConfig, xICAPMetadata)
+			go blh.processRecordAction(httpRequest, bodySnapshot, identity, urlConfig, xICAPMetadata)
 			return utils.NoModificationStatusCodeStr, false, nil
 		case "redact", "smart", "blind_redact":
 			logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("Redaction action '%s' detected for URL '%s'", action, requestURL)))
@@ -163,9 +177,12 @@ func (blh *BusinessLogicHandler) ProcessRequest(
 	return utils.NoModificationStatusCodeStr, false, nil
 }
 
-// processRecordAction processes a record action in the background
+// processRecordAction processes a record action in the background.
+// bodyBytes must be pre-read by the caller before launching this goroutine; the caller
+// also restores httpRequest.Body so that the ICAP service can still consume it.
 func (blh *BusinessLogicHandler) processRecordAction(
 	httpRequest *http.Request,
+	bodyBytes []byte,
 	identity *IdentityInfo,
 	urlConfig *URLConfig,
 	xICAPMetadata string,
@@ -185,21 +202,7 @@ func (blh *BusinessLogicHandler) processRecordAction(
 	}
 
 	logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, "ICAP SQS CLIENT INITIALIZED: Proceeding with recording request"))
-
-	// Read request body
-	var bodyBytes []byte
-	if httpRequest != nil && httpRequest.Body != nil {
-		var readErr error
-		bodyBytes, readErr = io.ReadAll(httpRequest.Body)
-		if readErr != nil {
-			logging.Logger.Warn(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("ICAP BODY READ ERROR: Failed to read request body: %v", readErr)))
-		} else {
-			logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("ICAP BODY READ: Read %d bytes from request body", len(bodyBytes))))
-		}
-		httpRequest.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	} else {
-		logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, "ICAP BODY READ: Request body is nil or empty"))
-	}
+	logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("ICAP BODY READ: Using pre-read snapshot of %d bytes", len(bodyBytes))))
 
 	logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
 		"ICAP RECORD PAYLOAD: json_valid=%v body_bytes=%d content_paths_bytes=%d",
