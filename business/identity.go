@@ -23,7 +23,8 @@ func NewIdentityExtractor() *IdentityExtractor {
 // IdentityInfo contains extracted identity information
 type IdentityInfo struct {
 	TenantID string
-	UserID   string
+	UserID   string // proxy username (primary) or JWT sub fallback for direct API calls
+	Username string // friendly display name (e.g. X-Client-Username from G3 proxy)
 	SourceIP string
 }
 
@@ -43,26 +44,11 @@ func (ie *IdentityExtractor) ExtractIdentity(icapHeaders, httpHeaders http.Heade
 		mergedHeaders[k] = v
 	}
 
-	if auth := mergedHeaders.Get("Authorization"); auth != "" {
-		parts := strings.SplitN(auth, " ", 2)
-		if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
-			token := parts[1]
-			parser := jwt.NewParser()
-			claims := jwt.MapClaims{}
-			_, _, err := parser.ParseUnverified(token, claims)
-			if err == nil && info.UserID == "" {
-				if sub, ok := claims["sub"].(string); ok {
-					info.UserID = sub
-				}
-			}
-		}
-	}
-
-	// Extract from G3 Proxy authentication headers
+	// G3 proxy authentication headers take priority — the proxy username is the
+	// authoritative organizational identity for ICAP-intercepted requests.
 	if user := mergedHeaders.Get("X-Client-Username"); user != "" {
-		if info.UserID == "" {
-			info.UserID = user
-		}
+		info.UserID = user
+		info.Username = user
 	}
 
 	if authUser := mergedHeaders.Get("X-Authenticated-User"); authUser != "" {
@@ -74,6 +60,23 @@ func (ie *IdentityExtractor) ExtractIdentity(icapHeaders, httpHeaders http.Heade
 				userID := strings.TrimPrefix(decodedStr, "Local://")
 				if info.UserID == "" {
 					info.UserID = userID
+				}
+			}
+		}
+	}
+
+	// JWT Bearer sub is a fallback only — used when no proxy username is available
+	// (e.g. direct API calls that bypass the proxy).
+	if auth := mergedHeaders.Get("Authorization"); auth != "" {
+		parts := strings.SplitN(auth, " ", 2)
+		if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
+			token := parts[1]
+			parser := jwt.NewParser()
+			claims := jwt.MapClaims{}
+			_, _, err := parser.ParseUnverified(token, claims)
+			if err == nil && info.UserID == "" {
+				if sub, ok := claims["sub"].(string); ok {
+					info.UserID = sub
 				}
 			}
 		}

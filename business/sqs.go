@@ -45,20 +45,28 @@ func NewSQSClient(queueURL, region, accessKeyID, secretAccessKey string) (*SQSCl
 
 // RecordingRequest represents a recording request message
 type RecordingRequest struct {
-	Body           string            `json:"body"`
-	Headers        map[string]string `json:"headers"`
-	URL            string            `json:"url"`
-	Method         string            `json:"method"`
-	UserID         string            `json:"user_id,omitempty"`
-	TenantID       string            `json:"tenant_id,omitempty"`
-	RegionCode     string            `json:"region_code,omitempty"` // Region code (e.g. us-east, eu) for this ICAP deployment; backend resolves to region_id
-	SessionID      string            `json:"session_id,omitempty"`
-	SourceIP       string            `json:"source_ip,omitempty"`
-	ToolID         string            `json:"tool_id,omitempty"`
-	IsToolSanctioned *bool           `json:"is_tool_sanctioned,omitempty"`
-	EndpointID     string            `json:"endpoint_id,omitempty"`
-	ContentPaths   json.RawMessage   `json:"content_paths,omitempty"`
-	Timestamp      string            `json:"timestamp"`
+	Body             string            `json:"body"`
+	Headers          map[string]string `json:"headers"`
+	URL              string            `json:"url"`
+	Method           string            `json:"method"`
+	UserID           string            `json:"user_id,omitempty"`
+	Username         string            `json:"username,omitempty"` // friendly display name from proxy (e.g. X-Client-Username)
+	TenantID         string            `json:"tenant_id,omitempty"`
+	RegionCode       string            `json:"region_code,omitempty"` // Region code (e.g. us-east, eu) for this ICAP deployment; backend resolves to region_id
+	SessionID        string            `json:"session_id,omitempty"`
+	SourceIP         string            `json:"source_ip,omitempty"`
+	ToolID           string            `json:"tool_id,omitempty"`
+	IsToolSanctioned *bool             `json:"is_tool_sanctioned,omitempty"`
+	EndpointID       string            `json:"endpoint_id,omitempty"`
+	ContentPaths     json.RawMessage   `json:"content_paths,omitempty"`
+	Timestamp        string            `json:"timestamp"`
+	// File attachment fields — populated when the intercepted request is a multipart file upload.
+	FileS3Key        string `json:"file_s3_key,omitempty"`
+	FileName         string `json:"file_name,omitempty"`
+	FileContentType  string `json:"file_content_type,omitempty"`
+	FileSize         int64  `json:"file_size,omitempty"`
+	FileSHA256       string `json:"file_sha256,omitempty"`
+	HasFileAttachment bool   `json:"has_file_attachment,omitempty"`
 }
 
 // EnqueueRecordingRequest sends a recording request to SQS

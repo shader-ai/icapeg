@@ -16,9 +16,9 @@ var (
 
 const endpointCacheRefreshInterval = 5 * time.Minute
 
-// Init initializes the business logic handler with database and SQS configuration.
+// Init initializes the business logic handler with database, SQS, and S3 configuration.
 // Endpoint cache (ai_tool_endpoints) is loaded at startup and refreshed periodically.
-func Init(databaseURL, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey string) error {
+func Init(databaseURL, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket string) error {
 	var initErr error
 	initOnce.Do(func() {
 		// Initialize database connection
@@ -36,7 +36,7 @@ func Init(databaseURL, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKe
 
 		// Initialize business logic handler (this loads the endpoint cache via NewURLMatcher)
 		if db != nil {
-			handler, err := NewBusinessLogicHandler(db, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey)
+			handler, err := NewBusinessLogicHandler(db, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket)
 			if err != nil {
 				logging.Logger.Warn(fmt.Sprintf("Failed to initialize business logic handler: %v", err))
 			}

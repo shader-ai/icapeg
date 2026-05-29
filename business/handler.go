@@ -2,16 +2,26 @@ package business
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/textproto"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	utils "icapeg/consts"
 	"icapeg/logging"
 )
@@ -22,10 +32,15 @@ type BusinessLogicHandler struct {
 	identityExtractor *IdentityExtractor
 	urlMatcher        *URLMatcher
 	sqsClient         *SQSClient
+	s3Client          *s3.S3
+	s3Bucket          string
+	awsRegion         string
+	awsAccessKeyID    string
+	awsSecretAccessKey string
 }
 
 // NewBusinessLogicHandler creates a new business logic handler
-func NewBusinessLogicHandler(db *sql.DB, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey string) (*BusinessLogicHandler, error) {
+func NewBusinessLogicHandler(db *sql.DB, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket string) (*BusinessLogicHandler, error) {
 	tenantValidator := NewTenantValidator(db)
 	identityExtractor := NewIdentityExtractor()
 	urlMatcher := NewURLMatcher(db)
@@ -44,12 +59,119 @@ func NewBusinessLogicHandler(db *sql.DB, sqsQueueURL, sqsRegion, sqsAccessKeyID,
 		logging.Logger.Warn("ICAP SQS INIT SKIPPED: RECORDING_QUEUE_URL not configured - SQS functionality will be disabled")
 	}
 
+	// Initialize S3 client for file uploads (reuses the same AWS credentials as SQS).
+	var s3Client *s3.S3
+	if s3Bucket != "" && sqsRegion != "" {
+		cfg := aws.NewConfig().
+			WithRegion(sqsRegion).
+			WithCredentials(credentials.NewStaticCredentials(sqsAccessKeyID, sqsSecretAccessKey, ""))
+		sess, sessErr := session.NewSession(cfg)
+		if sessErr != nil {
+			logging.Logger.Warn(fmt.Sprintf("ICAP S3 INIT FAILED: %v — file uploads will be skipped", sessErr))
+		} else {
+			s3Client = s3.New(sess)
+			logging.Logger.Info(fmt.Sprintf("ICAP S3 INIT SUCCESS: bucket=%s region=%s", s3Bucket, sqsRegion))
+		}
+	} else {
+		logging.Logger.Warn("ICAP S3 INIT SKIPPED: URAI_FILE_BUCKET not configured — file uploads will be skipped")
+	}
+
 	return &BusinessLogicHandler{
-		tenantValidator:   tenantValidator,
-		identityExtractor: identityExtractor,
-		urlMatcher:        urlMatcher,
-		sqsClient:         sqsClient,
+		tenantValidator:    tenantValidator,
+		identityExtractor:  identityExtractor,
+		urlMatcher:         urlMatcher,
+		sqsClient:          sqsClient,
+		s3Client:           s3Client,
+		s3Bucket:           s3Bucket,
+		awsRegion:          sqsRegion,
+		awsAccessKeyID:     sqsAccessKeyID,
+		awsSecretAccessKey: sqsSecretAccessKey,
 	}, nil
+}
+
+// randomHex returns n random bytes hex-encoded, for collision-free S3 object names.
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// Fall back to a timestamp-based value; extremely unlikely to be hit.
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+// uploadFileToS3 extracts the first file part from a multipart/form-data body and uploads it
+// to S3. Returns (s3Key, fileName, contentType, sizeBytes, sha256Hex, ok). If the body is not
+// multipart or the upload fails, ok is false and the caller falls back to text recording.
+//
+// The object key uses a random UUID-style name (not the raw upload filename) to avoid
+// collisions and path traversal: file-uploads/<tenant_id>/<record_id>/<uuid><ext>.
+func (blh *BusinessLogicHandler) uploadFileToS3(
+	tenantID, recordID string,
+	bodyBytes []byte,
+	contentTypeHeader string,
+	xICAPMetadata string,
+) (s3Key, fileName, contentType string, sizeBytes int64, sha256Hex string, ok bool) {
+	if blh.s3Client == nil || blh.s3Bucket == "" {
+		return "", "", "", 0, "", false
+	}
+
+	mediaType, params, err := mime.ParseMediaType(contentTypeHeader)
+	if err != nil || !strings.HasPrefix(mediaType, "multipart/") {
+		return "", "", "", 0, "", false
+	}
+
+	boundary := params["boundary"]
+	if boundary == "" {
+		return "", "", "", 0, "", false
+	}
+
+	mr := multipart.NewReader(bytes.NewReader(bodyBytes), boundary)
+	for {
+		part, partErr := mr.NextPart()
+		if partErr != nil {
+			break
+		}
+		fileBytes, readErr := io.ReadAll(part)
+		part.Close()
+		if readErr != nil || len(fileBytes) == 0 {
+			continue
+		}
+
+		partFileName := part.FileName()
+		if partFileName == "" {
+			continue // skip non-file fields
+		}
+
+		partContentType := part.Header.Get("Content-Type")
+		if partContentType == "" {
+			partContentType = "application/octet-stream"
+		}
+
+		// Random object name + extension derived from the original filename.
+		ext := strings.ToLower(filepath.Ext(partFileName))
+		key := fmt.Sprintf("file-uploads/%s/%s/%s%s", tenantID, recordID, randomHex(16), ext)
+
+		sum := sha256.Sum256(fileBytes)
+		hexSum := hex.EncodeToString(sum[:])
+
+		_, putErr := blh.s3Client.PutObject(&s3.PutObjectInput{
+			Bucket:      aws.String(blh.s3Bucket),
+			Key:         aws.String(key),
+			Body:        bytes.NewReader(fileBytes),
+			ContentType: aws.String(partContentType),
+		})
+		if putErr != nil {
+			logging.Logger.Error(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
+				"ICAP S3 UPLOAD FAILED: key=%s err=%v", key, putErr)))
+			return "", "", "", 0, "", false
+		}
+
+		logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
+			"ICAP S3 UPLOAD SUCCESS: key=%s size=%d sha256=%s", key, len(fileBytes), hexSum)))
+		return key, partFileName, partContentType, int64(len(fileBytes)), hexSum, true
+	}
+
+	return "", "", "", 0, "", false
 }
 
 // RefreshEndpointCache reloads ai_tool_endpoints from the database. Call on startup or periodically.
@@ -228,22 +350,46 @@ func (blh *BusinessLogicHandler) processRecordAction(
 	regionCode := strings.TrimSpace(os.Getenv("REGION_CODE"))
 
 	recordingReq := &RecordingRequest{
-		Body:           string(bodyBytes),
-		Headers:        headers,
-		URL:            requestURL,
-		Method:         method,
-		UserID:         identity.UserID,
-		TenantID:       identity.TenantID,
-		RegionCode:     regionCode,
-		SessionID:      sessionID,
-		SourceIP:       identity.SourceIP,
-		ToolID:         urlConfig.ToolID,
+		Body:             string(bodyBytes),
+		Headers:          headers,
+		URL:              requestURL,
+		Method:           method,
+		UserID:           identity.UserID,
+		Username:         identity.Username,
+		TenantID:         identity.TenantID,
+		RegionCode:       regionCode,
+		SessionID:        sessionID,
+		SourceIP:         identity.SourceIP,
+		ToolID:           urlConfig.ToolID,
 		IsToolSanctioned: urlConfig.IsToolSanctioned,
-		EndpointID:     urlConfig.ID,
-		Timestamp:      time.Now().UTC().Format(time.RFC3339),
+		EndpointID:       urlConfig.ID,
+		Timestamp:        time.Now().UTC().Format(time.RFC3339),
 	}
 	if len(urlConfig.ContentPaths) > 0 {
 		recordingReq.ContentPaths = append(json.RawMessage(nil), urlConfig.ContentPaths...)
+	}
+
+	// Detect multipart file upload: extract file, upload to S3, attach key to SQS message.
+	// Use a deterministic record ID derived from the SQS MessageId (same logic as backend).
+	contentTypeHdr := ""
+	if httpRequest != nil {
+		contentTypeHdr = httpRequest.Header.Get("Content-Type")
+	}
+	if s3Key, fName, fCT, fSize, fSHA, ok := blh.uploadFileToS3(
+		identity.TenantID,
+		fmt.Sprintf("%d", time.Now().UnixNano()), // proxy record ID — backend derives its own from SQS MessageId
+		bodyBytes,
+		contentTypeHdr,
+		xICAPMetadata,
+	); ok {
+		recordingReq.FileS3Key = s3Key
+		recordingReq.FileName = fName
+		recordingReq.FileContentType = fCT
+		recordingReq.FileSize = fSize
+		recordingReq.FileSHA256 = fSHA
+		recordingReq.HasFileAttachment = true
+		// Don't send the raw binary body for file uploads — it's already in S3.
+		recordingReq.Body = ""
 	}
 
 	logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("ICAP PREPARING SQS MESSAGE: URL='%s', Method='%s', TenantID='%s', UserID='%s', RegionCode='%s', ToolID='%s', BodySize=%d bytes",

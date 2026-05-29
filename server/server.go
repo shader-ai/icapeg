@@ -51,8 +51,12 @@ func StartServer() error {
 	}
 	sqsAccessKeyID := os.Getenv("AWS_ACCESS_KEY_ID")
 	sqsSecretAccessKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	s3Bucket := os.Getenv("URAI_FILE_BUCKET")
+	if s3Bucket == "" {
+		s3Bucket = "stage-urai"
+	}
 
-	if err := business.Init(databaseURL, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey); err != nil {
+	if err := business.Init(databaseURL, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket); err != nil {
 		logging.Logger.Warn(fmt.Sprintf("Failed to initialize business logic: %v. Continuing without business logic features.", err))
 	}
 	logRecordingPipelineEnv(databaseURL, sqsQueueURL)
