@@ -270,8 +270,7 @@ func (um *URLMatcher) MatchURL(requestURL, tenantID, httpMethod string) (*URLCon
 		requestPath = requestPath + "/"
 	}
 
-	logging.Logger.Info(fmt.Sprintf("ICAP URL MATCHING START: requestURL='%s', baseURL='%s', path='%s', method='%s', tenantID='%s'",
-		requestURL, baseURL, requestPath, httpMethod, tenantID))
+	logging.Logger.Debug(fmt.Sprintf("URL matching: url='%s' method='%s' tenant='%s'", requestURL, httpMethod, tenantID))
 
 	var altBaseURL string
 	if strings.HasPrefix(baseURL, "http://") {
@@ -315,8 +314,7 @@ func (um *URLMatcher) MatchURL(requestURL, tenantID, httpMethod string) (*URLCon
 		}
 	}
 	if matched == nil {
-		logging.Logger.Info(fmt.Sprintf("ICAP NO URL CONFIG FOUND: baseURL='%s', requestURL='%s', tenant='%s' (no cached endpoint or path match)",
-			baseURL, requestURL, tenantID))
+		logging.Logger.Debug(fmt.Sprintf("no endpoint match: url='%s' tenant='%s'", requestURL, tenantID))
 		return nil, nil
 	}
 

@@ -67,6 +67,18 @@ type RecordingRequest struct {
 	FileSize         int64  `json:"file_size,omitempty"`
 	FileSHA256       string `json:"file_sha256,omitempty"`
 	HasFileAttachment bool   `json:"has_file_attachment,omitempty"`
+	// Files carries every attachment for multi-file multipart uploads. The single FileS3Key/
+	// FileName/... fields above mirror the first entry for backward compatibility.
+	Files            []RecordedFile `json:"files,omitempty"`
+}
+
+// RecordedFile is one uploaded attachment stored in S3 (multipart multi-file uploads).
+type RecordedFile struct {
+	FileS3Key       string `json:"file_s3_key"`
+	FileName        string `json:"file_name,omitempty"`
+	FileContentType string `json:"file_content_type,omitempty"`
+	FileSize        int64  `json:"file_size,omitempty"`
+	FileSHA256      string `json:"file_sha256,omitempty"`
 }
 
 // EnqueueRecordingRequest sends a recording request to SQS
@@ -128,6 +140,5 @@ func (s *SQSClient) EnqueueRecordingRequest(req *RecordingRequest) error {
 		return fmt.Errorf("SQS enqueue failed: %v", err)
 	}
 
-	logging.Logger.Info(fmt.Sprintf("Successfully enqueued recording request to SQS for URL '%s'", req.URL))
 	return nil
 }

@@ -99,33 +99,34 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// uploadFileToS3 extracts the first file part from a multipart/form-data body and uploads it
-// to S3. Returns (s3Key, fileName, contentType, sizeBytes, sha256Hex, ok). If the body is not
-// multipart or the upload fails, ok is false and the caller falls back to text recording.
+// uploadFilesToS3 extracts every file part from a multipart/form-data body and uploads each to
+// S3, returning one RecordedFile per successfully-stored attachment. Returns nil if the body is
+// not multipart or no file part is present. A single failed part is skipped (others still upload).
 //
-// The object key uses a random UUID-style name (not the raw upload filename) to avoid
+// Each object key uses a random UUID-style name (not the raw upload filename) to avoid
 // collisions and path traversal: file-uploads/<tenant_id>/<record_id>/<uuid><ext>.
-func (blh *BusinessLogicHandler) uploadFileToS3(
+func (blh *BusinessLogicHandler) uploadFilesToS3(
 	tenantID, recordID string,
 	bodyBytes []byte,
 	contentTypeHeader string,
 	xICAPMetadata string,
-) (s3Key, fileName, contentType string, sizeBytes int64, sha256Hex string, ok bool) {
+) []RecordedFile {
 	if blh.s3Client == nil || blh.s3Bucket == "" {
-		return "", "", "", 0, "", false
+		return nil
 	}
 
 	mediaType, params, err := mime.ParseMediaType(contentTypeHeader)
 	if err != nil || !strings.HasPrefix(mediaType, "multipart/") {
-		return "", "", "", 0, "", false
+		return nil
 	}
 
 	boundary := params["boundary"]
 	if boundary == "" {
-		return "", "", "", 0, "", false
+		return nil
 	}
 
 	mr := multipart.NewReader(bytes.NewReader(bodyBytes), boundary)
+	var files []RecordedFile
 	for {
 		part, partErr := mr.NextPart()
 		if partErr != nil {
@@ -163,15 +164,21 @@ func (blh *BusinessLogicHandler) uploadFileToS3(
 		if putErr != nil {
 			logging.Logger.Error(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
 				"ICAP S3 UPLOAD FAILED: key=%s err=%v", key, putErr)))
-			return "", "", "", 0, "", false
+			continue
 		}
 
 		logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
 			"ICAP S3 UPLOAD SUCCESS: key=%s size=%d sha256=%s", key, len(fileBytes), hexSum)))
-		return key, partFileName, partContentType, int64(len(fileBytes)), hexSum, true
+		files = append(files, RecordedFile{
+			FileS3Key:       key,
+			FileName:        partFileName,
+			FileContentType: partContentType,
+			FileSize:        int64(len(fileBytes)),
+			FileSHA256:      hexSum,
+		})
 	}
 
-	return "", "", "", 0, "", false
+	return files
 }
 
 // RefreshEndpointCache reloads ai_tool_endpoints from the database. Call on startup or periodically.
@@ -291,7 +298,7 @@ func (blh *BusinessLogicHandler) ProcessRequest(
 			go blh.processRecordAction(httpRequest, bodySnapshot, identity, urlConfig, xICAPMetadata)
 			return utils.NoModificationStatusCodeStr, false, nil
 		case "redact", "smart", "blind_redact":
-			logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("Redaction action '%s' detected for URL '%s'", action, requestURL)))
+			logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("redact action '%s' passthrough for url='%s'", action, requestURL)))
 			return utils.NoModificationStatusCodeStr, false, nil
 		}
 	}
@@ -316,15 +323,12 @@ func (blh *BusinessLogicHandler) processRecordAction(
 		method = httpRequest.Method
 	}
 
-	logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("ICAP PROCESS RECORD ACTION: Starting SQS processing for URL '%s'", requestURL)))
-
 	if blh.sqsClient == nil {
 		logging.Logger.Warn(utils.PrepareLogMsg(xICAPMetadata, "ICAP SQS CLIENT NOT INITIALIZED: SQS client is nil - skipping recording. Check RECORDING_QUEUE_URL environment variable."))
 		return
 	}
 
-	logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, "ICAP SQS CLIENT INITIALIZED: Proceeding with recording request"))
-	logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("ICAP BODY READ: Using pre-read snapshot of %d bytes", len(bodyBytes))))
+	logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("body snapshot: %d bytes", len(bodyBytes))))
 
 	logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
 		"ICAP RECORD PAYLOAD: json_valid=%v body_bytes=%d content_paths_bytes=%d",
@@ -375,18 +379,21 @@ func (blh *BusinessLogicHandler) processRecordAction(
 	if httpRequest != nil {
 		contentTypeHdr = httpRequest.Header.Get("Content-Type")
 	}
-	if s3Key, fName, fCT, fSize, fSHA, ok := blh.uploadFileToS3(
+	if files := blh.uploadFilesToS3(
 		identity.TenantID,
 		fmt.Sprintf("%d", time.Now().UnixNano()), // proxy record ID — backend derives its own from SQS MessageId
 		bodyBytes,
 		contentTypeHdr,
 		xICAPMetadata,
-	); ok {
-		recordingReq.FileS3Key = s3Key
-		recordingReq.FileName = fName
-		recordingReq.FileContentType = fCT
-		recordingReq.FileSize = fSize
-		recordingReq.FileSHA256 = fSHA
+	); len(files) > 0 {
+		recordingReq.Files = files
+		// Mirror the first attachment into the legacy single fields for backward compatibility.
+		first := files[0]
+		recordingReq.FileS3Key = first.FileS3Key
+		recordingReq.FileName = first.FileName
+		recordingReq.FileContentType = first.FileContentType
+		recordingReq.FileSize = first.FileSize
+		recordingReq.FileSHA256 = first.FileSHA256
 		recordingReq.HasFileAttachment = true
 		// Don't send the raw binary body for file uploads — it's already in S3.
 		recordingReq.Body = ""
