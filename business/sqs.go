@@ -50,7 +50,10 @@ type RecordingRequest struct {
 	URL              string            `json:"url"`
 	Method           string            `json:"method"`
 	UserID           string            `json:"user_id,omitempty"`
-	Username         string            `json:"username,omitempty"` // friendly display name from proxy (e.g. X-Client-Username)
+	Username         string            `json:"username,omitempty"`    // sAMAccountName / proxy username from G3
+	DisplayName      string            `json:"display_name,omitempty"` // AD displayName
+	Email            string            `json:"email,omitempty"`        // AD mail
+	Department       string            `json:"department,omitempty"`   // AD department
 	TenantID         string            `json:"tenant_id,omitempty"`
 	RegionCode       string            `json:"region_code,omitempty"` // Region code (e.g. us-east, eu) for this ICAP deployment; backend resolves to region_id
 	SessionID        string            `json:"session_id,omitempty"`

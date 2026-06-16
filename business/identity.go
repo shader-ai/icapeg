@@ -22,10 +22,15 @@ func NewIdentityExtractor() *IdentityExtractor {
 
 // IdentityInfo contains extracted identity information
 type IdentityInfo struct {
-	TenantID string
-	UserID   string // proxy username (primary) or JWT sub fallback for direct API calls
-	Username string // friendly display name (e.g. X-Client-Username from G3 proxy)
-	SourceIP string
+	TenantID    string
+	UserID      string // proxy username (primary) or JWT sub fallback for direct API calls
+	Username    string // friendly display name (e.g. X-Client-Username from G3 proxy)
+	SourceIP    string
+	// AD attributes — populated by LDAPEnricher after identity extraction
+	DisplayName string
+	GivenName   string
+	Email       string
+	Department  string
 }
 
 // ExtractIdentity extracts tenant ID from env, user ID and source IP from ICAP/HTTP headers.

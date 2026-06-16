@@ -28,14 +28,15 @@ import (
 
 // BusinessLogicHandler handles all business logic for ICAP requests
 type BusinessLogicHandler struct {
-	tenantValidator   *TenantValidator
-	identityExtractor *IdentityExtractor
-	urlMatcher        *URLMatcher
-	sqsClient         *SQSClient
-	s3Client          *s3.S3
-	s3Bucket          string
-	awsRegion         string
-	awsAccessKeyID    string
+	tenantValidator    *TenantValidator
+	identityExtractor  *IdentityExtractor
+	ldapEnricher       *LDAPEnricher
+	urlMatcher         *URLMatcher
+	sqsClient          *SQSClient
+	s3Client           *s3.S3
+	s3Bucket           string
+	awsRegion          string
+	awsAccessKeyID     string
 	awsSecretAccessKey string
 }
 
@@ -43,7 +44,13 @@ type BusinessLogicHandler struct {
 func NewBusinessLogicHandler(db *sql.DB, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket string) (*BusinessLogicHandler, error) {
 	tenantValidator := NewTenantValidator(db)
 	identityExtractor := NewIdentityExtractor()
+	ldapEnricher := NewLDAPEnricher()
 	urlMatcher := NewURLMatcher(db)
+	if ldapEnricher.Enabled() {
+		logging.Logger.Info("LDAP ENRICHER: enabled — will fetch AD attributes (name, email, department) per request")
+	} else {
+		logging.Logger.Warn("LDAP ENRICHER: disabled — set LDAP_HOST, LDAP_BASE_DN, LDAP_BIND_DN, LDAP_BIND_PASSWORD to enable AD attribute enrichment")
+	}
 
 	var sqsClient *SQSClient
 	var err error
@@ -79,6 +86,7 @@ func NewBusinessLogicHandler(db *sql.DB, sqsQueueURL, sqsRegion, sqsAccessKeyID,
 	return &BusinessLogicHandler{
 		tenantValidator:    tenantValidator,
 		identityExtractor:  identityExtractor,
+		ldapEnricher:       ldapEnricher,
 		urlMatcher:         urlMatcher,
 		sqsClient:          sqsClient,
 		s3Client:           s3Client,
@@ -217,6 +225,22 @@ func (blh *BusinessLogicHandler) ProcessRequest(
 		logging.Logger.Warn(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("Failed to extract identity: %v", err)))
 		if identity == nil {
 			return utils.BadRequestStatusCodeStr, false, fmt.Errorf("failed to extract identity: %v", err)
+		}
+	}
+
+	// Enrich identity with AD attributes (displayName, email, department) via LDAP search.
+	if identity != nil && identity.UserID != "" {
+		if adAttrs, enrichErr := blh.ldapEnricher.FetchAttributes(identity.UserID); enrichErr != nil {
+			logging.Logger.Warn(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("LDAP ENRICHER ERROR: %v", enrichErr)))
+		} else if adAttrs != nil {
+			identity.DisplayName = adAttrs.DisplayName
+			identity.GivenName = adAttrs.GivenName
+			identity.Email = adAttrs.Email
+			identity.Department = adAttrs.Department
+			logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
+				"AD IDENTITY: username=%s name=%q email=%q department=%q",
+				identity.UserID, identity.DisplayName, identity.Email, identity.Department,
+			)))
 		}
 	}
 
@@ -360,6 +384,9 @@ func (blh *BusinessLogicHandler) processRecordAction(
 		Method:           method,
 		UserID:           identity.UserID,
 		Username:         identity.Username,
+		DisplayName:      identity.DisplayName,
+		Email:            identity.Email,
+		Department:       identity.Department,
 		TenantID:         identity.TenantID,
 		RegionCode:       regionCode,
 		SessionID:        sessionID,
