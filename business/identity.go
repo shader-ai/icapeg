@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/golang-jwt/jwt/v5"
+	"github.com/golang-jwt/jwt/v4"
 )
 
 // IdentityExtractor extracts tenant ID, user ID, and source IP from headers and environment.
@@ -78,7 +78,7 @@ func (ie *IdentityExtractor) ExtractIdentity(icapHeaders, httpHeaders http.Heade
 			token := parts[1]
 			parser := jwt.NewParser()
 			claims := jwt.MapClaims{}
-			_, _, err := parser.ParseUnverified(token, claims)
+			_, err := parser.ParseUnverified(token, claims)
 			if err == nil && info.UserID == "" {
 				if sub, ok := claims["sub"].(string); ok {
 					info.UserID = sub
