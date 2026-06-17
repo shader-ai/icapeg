@@ -37,10 +37,11 @@ type BusinessLogicHandler struct {
 	awsRegion          string
 	awsAccessKeyID     string
 	awsSecretAccessKey string
+	ldapEnricher       *LDAPEnricher
 }
 
 // NewBusinessLogicHandler creates a new business logic handler
-func NewBusinessLogicHandler(db *sql.DB, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket string) (*BusinessLogicHandler, error) {
+func NewBusinessLogicHandler(db *sql.DB, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket string, enricher *LDAPEnricher) (*BusinessLogicHandler, error) {
 	tenantValidator := NewTenantValidator(db)
 	identityExtractor := NewIdentityExtractor()
 	urlMatcher := NewURLMatcher(db)
@@ -77,15 +78,16 @@ func NewBusinessLogicHandler(db *sql.DB, sqsQueueURL, sqsRegion, sqsAccessKeyID,
 	}
 
 	return &BusinessLogicHandler{
-		tenantValidator:   tenantValidator,
-		identityExtractor: identityExtractor,
-		urlMatcher:        urlMatcher,
+		tenantValidator:    tenantValidator,
+		identityExtractor:  identityExtractor,
+		urlMatcher:         urlMatcher,
 		sqsClient:          sqsClient,
 		s3Client:           s3Client,
 		s3Bucket:           s3Bucket,
 		awsRegion:          sqsRegion,
 		awsAccessKeyID:     sqsAccessKeyID,
 		awsSecretAccessKey: sqsSecretAccessKey,
+		ldapEnricher:       enricher,
 	}, nil
 }
 
@@ -220,24 +222,20 @@ func (blh *BusinessLogicHandler) ProcessRequest(
 		}
 	}
 
-	// Collect all X-Client-* headers injected by G3 proxy after LDAP bind.
-	// G3 injects AD attributes at the ICAP level (not into the encapsulated HTTP request),
-	// so we must scan both maps. ICAP headers take priority on collision.
+	// Enrich identity with AD attributes via service-account LDAP search.
+	// G3 passes only X-Client-Username; ICAPeg owns enrichment (email, display_name, department).
 	userAttributes := make(map[string]string)
-	for _, headerMap := range []http.Header{httpHeaderMap, icapHeaderMap} {
-		for key, vals := range headerMap {
-			if strings.HasPrefix(strings.ToLower(key), "x-client-") && len(vals) > 0 && vals[0] != "" {
-				attrKey := strings.ToLower(strings.TrimPrefix(strings.ToLower(key), "x-client-"))
-				attrKey = strings.ReplaceAll(attrKey, "-", "_")
-				userAttributes[attrKey] = vals[0]
-			}
+	if blh.ldapEnricher != nil && identity.Username != "" {
+		if attrs, enrichErr := blh.ldapEnricher.Enrich(identity.Username); enrichErr != nil {
+			logging.Logger.Warn(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
+				"LDAP enrich failed for %q: %v", identity.Username, enrichErr)))
+		} else {
+			userAttributes = attrs
 		}
 	}
-	if len(userAttributes) > 0 {
-		logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
-			"CLIENT IDENTITY: username=%s attributes=%v", identity.UserID, userAttributes,
-		)))
-	}
+	logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
+		"CLIENT IDENTITY: username=%s attributes=%v", identity.UserID, userAttributes,
+	)))
 
 	// Validate tenant and user
 	isValid, err := blh.tenantValidator.ValidateTenantAndUser(identity.TenantID, identity.UserID)

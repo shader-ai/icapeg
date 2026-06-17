@@ -56,7 +56,14 @@ func StartServer() error {
 		s3Bucket = "stage-urai"
 	}
 
-	if err := business.Init(databaseURL, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket); err != nil {
+	ldapHost := os.Getenv("LDAP_HOST")
+	ldapPort := os.Getenv("LDAP_PORT")
+	ldapBaseDN := os.Getenv("LDAP_BASE_DN")
+	ldapBindDN := os.Getenv("LDAP_BIND_DN")
+	ldapBindPassword := os.Getenv("LDAP_BIND_PASSWORD")
+
+	if err := business.InitWithLDAP(databaseURL, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket,
+		ldapHost, ldapPort, ldapBaseDN, ldapBindDN, ldapBindPassword); err != nil {
 		logging.Logger.Warn(fmt.Sprintf("Failed to initialize business logic: %v. Continuing without business logic features.", err))
 	}
 	logRecordingPipelineEnv(databaseURL, sqsQueueURL)

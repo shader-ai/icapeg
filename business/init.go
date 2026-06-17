@@ -16,9 +16,16 @@ var (
 
 const endpointCacheRefreshInterval = 5 * time.Minute
 
-// Init initializes the business logic handler with database, SQS, and S3 configuration.
+// Init initializes the business logic handler with database, SQS, S3, and LDAP configuration.
 // Endpoint cache (ai_tool_endpoints) is loaded at startup and refreshed periodically.
 func Init(databaseURL, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket string) error {
+	return InitWithLDAP(databaseURL, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket, "", "", "", "", "")
+}
+
+// InitWithLDAP initializes the business logic handler including an optional LDAP enricher.
+// Pass empty strings for LDAP params to disable enrichment.
+func InitWithLDAP(databaseURL, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket,
+	ldapHost, ldapPort, ldapBaseDN, ldapBindDN, ldapBindPassword string) error {
 	var initErr error
 	initOnce.Do(func() {
 		// Initialize database connection
@@ -34,9 +41,21 @@ func Init(databaseURL, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKe
 			logging.Logger.Warn("Database URL not configured. Business logic features will be disabled.")
 		}
 
+		// Build optional LDAP enricher
+		var enricher *LDAPEnricher
+		if ldapHost != "" && ldapBindDN != "" && ldapBindPassword != "" {
+			if ldapPort == "" {
+				ldapPort = "389"
+			}
+			enricher = NewLDAPEnricher(ldapHost, ldapPort, ldapBaseDN, ldapBindDN, ldapBindPassword)
+			logging.Logger.Info(fmt.Sprintf("LDAP enricher initialized: %s:%s base=%q", ldapHost, ldapPort, ldapBaseDN))
+		} else {
+			logging.Logger.Warn("LDAP_HOST / LDAP_BIND_DN / LDAP_BIND_PASSWORD not set — AD enrichment disabled")
+		}
+
 		// Initialize business logic handler (this loads the endpoint cache via NewURLMatcher)
 		if db != nil {
-			handler, err := NewBusinessLogicHandler(db, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket)
+			handler, err := NewBusinessLogicHandler(db, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket, enricher)
 			if err != nil {
 				logging.Logger.Warn(fmt.Sprintf("Failed to initialize business logic handler: %v", err))
 			}
