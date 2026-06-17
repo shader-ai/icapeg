@@ -1,75 +1,60 @@
-# LDAP AD Enrichment
+# User Attribute Enrichment
 
-ICAPeg fetches user attributes from Active Directory on every ICAP request and forwards them downstream via request headers and the SQS recording payload.
+AD/LDAP enrichment is owned by **G3 proxy**, not ICAPeg. ICAPeg is a governance/inspection layer — it reads whatever headers G3 injects and forwards them downstream. No LDAP credentials or connections are needed in ICAPeg.
 
-## How it works
-
-```
-Browser → G3 Proxy (LDAP bind auth) → ICAPeg → AD (LDAP lookup) → upstream AI tool
-                                          ↓
-                                     SQS payload
-                                     (user attrs)
-                                          ↓
-                                     URAI backend
-```
-
-1. **G3 Proxy** authenticates the user via a live LDAP bind against the AD DC. The authenticated username is forwarded to ICAPeg in the `X-Client-Username` header.
-2. **ICAPeg** extracts the username from `X-Client-Username` and calls `LDAPEnricher.FetchAttributes()`.
-3. **LDAPEnricher** binds to AD using a service account and searches for the user by `sAMAccountName` or `cn`.
-4. The fetched attributes (`displayName`, `givenName`, `mail`, `department`) are:
-   - Injected as request headers (`X-Client-Name`, `X-Client-Email`, `X-Client-Department`)
-   - Logged via `logging.Logger`
-   - Included in the SQS `RecordingRequest` payload for permanent storage in the URAI backend
-
-## LDAPEnricher
-
-File: `business/ldap_enricher.go`
-
-Configured entirely via environment variables:
-
-| Variable | Description | Example |
-|---|---|---|
-| `LDAP_HOST` | AD hostname or IP | `localhost` |
-| `LDAP_PORT` | LDAP port (default `389`) | `389` |
-| `LDAP_BASE_DN` | Search base DN | `CN=Users,DC=gfoxai,DC=local` |
-| `LDAP_BIND_DN` | Service account bind DN | `CN=Administrator,CN=Users,DC=gfoxai,DC=local` |
-| `LDAP_BIND_PASSWORD` | Service account password | `Admin@2024!` |
-
-If any required variable (`LDAP_HOST`, `LDAP_BASE_DN`, `LDAP_BIND_DN`) is unset, enrichment is silently skipped — all other flows continue normally.
-
-## AD attributes fetched
-
-| AD Attribute | Header forwarded | SQS field |
-|---|---|---|
-| `displayName` | `X-Client-Name` | `display_name` |
-| `givenName` | `X-Client-Given-Name` | — |
-| `mail` | `X-Client-Email` | `email` |
-| `department` | `X-Client-Department` | `department` |
-
-## RecordingRequest fields added
-
-```go
-DisplayName string `json:"display_name,omitempty"` // from AD: displayName
-Email       string `json:"email,omitempty"`         // from AD: mail
-Department  string `json:"department,omitempty"`    // from AD: department
-```
-
-## Identity flow
+## Architecture
 
 ```
-X-Client-Username: rohan.rn
-        ↓
-LDAPEnricher.FetchAttributes("rohan.rn")
-        ↓
-AD search: (|(sAMAccountName=rohan.rn)(cn=rohan.rn))
-        ↓
-{DisplayName: "Rohan RN", Email: "rohan.rn@gfoxai.local", Department: "Engineering"}
-        ↓
-Injected into request headers + SQS payload
+Browser → G3 Proxy (live LDAP bind: auth + fetch attrs)
+               │
+               │  ICAP REQMOD headers
+               │  X-Client-Username: rohan.rn
+               │  X-Client-IP:       172.18.0.1
+               │  X-Client-mail:     rohan.rn@gfoxai.com
+               │  X-Client-givenName: Rohan
+               │  X-Client-sn:       RN
+               ▼
+           ICAPeg (reads X-Client-* headers dynamically — no LDAP needed)
+               │
+               │  SQS payload: user_attributes: {"mail": "...", "givenname": "..."}
+               ▼
+           URAI backend (merges into user_metadata JSONB)
 ```
 
-## Example ICAPeg log output
+## G3 configuration
 
+In `g3proxy.yaml`, set `extra_ldap_attrs` under the `ldap` user group:
+
+```yaml
+user_group:
+  - name: default_users
+    type: ldap
+    ldap_url: "ldap://host.docker.internal:389/CN=Users,DC=gfoxai,DC=local"
+    username_attribute: cn
+    response_timeout: 10s
+    extra_ldap_attrs:
+      - mail
+      - givenName
+      - sn
+      - department    # only if populated in your AD
 ```
-AD IDENTITY | user=rohan.rn | name="Rohan RN" | email="rohan.rn@gfoxai.local" | department="Engineering"
-```
+
+G3 performs a live LDAP bind per connection for authentication, then (if `extra_ldap_attrs` is non-empty) fetches those attributes in the same session and injects them as `X-Client-<AttrName>` ICAP headers.
+
+## ICAPeg behaviour
+
+ICAPeg reads every `X-Client-*` header dynamically — no hardcoded field names. New AD attributes added to G3's `extra_ldap_attrs` flow through automatically without any ICAPeg code changes.
+
+Headers are normalised to snake_case keys and forwarded in the SQS `RecordingRequest` as `user_attributes`:
+
+| G3 ICAP header | `user_attributes` key |
+|---|---|
+| `X-Client-Username` | `username` |
+| `X-Client-mail` | `mail` |
+| `X-Client-givenName` | `givenname` |
+| `X-Client-sn` | `sn` |
+| `X-Client-department` | `department` |
+
+## URAI backend
+
+The backend reads `user_attributes` from the SQS payload and merges it into the user's `user_metadata` JSONB column. Well-known keys are promoted to dedicated columns (`mail` → `email`, `givenName`/`sn` → `display_name`, `department` → `department`).

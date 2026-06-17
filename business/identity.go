@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // IdentityExtractor extracts tenant ID, user ID, and source IP from headers and environment.
@@ -22,15 +22,10 @@ func NewIdentityExtractor() *IdentityExtractor {
 
 // IdentityInfo contains extracted identity information
 type IdentityInfo struct {
-	TenantID    string
-	UserID      string // proxy username (primary) or JWT sub fallback for direct API calls
-	Username    string // friendly display name (e.g. X-Client-Username from G3 proxy)
-	SourceIP    string
-	// AD attributes — populated by LDAPEnricher after identity extraction
-	DisplayName string
-	GivenName   string
-	Email       string
-	Department  string
+	TenantID string
+	UserID   string // proxy username (primary) or JWT sub fallback for direct API calls
+	Username string // friendly display name (e.g. X-Client-Username from G3 proxy)
+	SourceIP string
 }
 
 // ExtractIdentity extracts tenant ID from env, user ID and source IP from ICAP/HTTP headers.
@@ -78,7 +73,7 @@ func (ie *IdentityExtractor) ExtractIdentity(icapHeaders, httpHeaders http.Heade
 			token := parts[1]
 			parser := jwt.NewParser()
 			claims := jwt.MapClaims{}
-			_, err := parser.ParseUnverified(token, claims)
+			_, _, err := parser.ParseUnverified(token, claims)
 			if err == nil && info.UserID == "" {
 				if sub, ok := claims["sub"].(string); ok {
 					info.UserID = sub

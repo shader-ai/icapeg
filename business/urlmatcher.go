@@ -182,116 +182,33 @@ func pathSegmentMatch(requestPath, configuredPath string) bool {
 	return true
 }
 
-// isRegexPattern returns true only when the pattern is explicitly marked as regex.
-// We intentionally do not auto-detect regex metacharacters because this matcher primarily
-// supports simple wildcard/glob paths. Use a leading '^' to opt into regex.
+// isRegexPattern returns true if path is a regex pattern (starts with ^ or contains regex metacharacters).
 func isRegexPattern(path string) bool {
-	return strings.HasPrefix(strings.TrimSpace(path), "^")
-}
-
-func normalizePath(p string) string {
-	p = strings.TrimSpace(p)
-	if p == "" {
-		return ""
-	}
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	return strings.TrimSuffix(p, "/") + "/"
-}
-
-// globToRegex converts a glob-like path pattern into an anchored regex.
-//
-// Supported:
-// - `**` matches across path segments (including '/')
-// - `*` matches within a single segment (excluding '/')
-// - a trailing `/*` (before the normalized trailing slash) matches the rest of the path
-//
-// Examples (after normalization adds trailing slash):
-// - `/api/v0/chat/*`      -> matches any deeper path under `/api/v0/chat/`
-// - `/chat/*/completion` -> matches exactly one segment between `chat/` and `/completion`
-// - `/completion*`       -> matches `/completion`, `/completion2`, etc.
-func globToRegex(glob string) string {
-	var b strings.Builder
-	b.Grow(len(glob) * 2)
-	b.WriteString("^")
-
-	for i := 0; i < len(glob); i++ {
-		ch := glob[i]
-		if ch == '*' {
-			if i+1 < len(glob) && glob[i+1] == '*' {
-				b.WriteString(".*")
-				i++
-				continue
-			}
-			if i > 0 && glob[i-1] == '/' && i+1 < len(glob) && glob[i+1] == '/' && i+2 == len(glob) {
-				b.WriteString(".*")
-				continue
-			}
-			b.WriteString(`[^/]*`)
-			continue
-		}
-		switch ch {
-		case '\\', '.', '+', '?', '^', '$', '(', ')', '[', ']', '{', '}', '|':
-			b.WriteByte('\\')
-		}
-		b.WriteByte(ch)
-	}
-
-	b.WriteString("$")
-	return b.String()
-}
-
-func hostMatchesWildcard(host, pattern string) bool {
-	host = strings.ToLower(strings.TrimSpace(host))
-	pattern = strings.ToLower(strings.TrimSpace(pattern))
-	if host == "" || pattern == "" {
-		return false
-	}
-	if host == pattern {
-		return true
-	}
-	if strings.HasPrefix(pattern, "*.") {
-		suffix := strings.TrimPrefix(pattern, "*")
-		return strings.HasSuffix(host, suffix)
-	}
-	if strings.HasPrefix(pattern, "*") {
-		suffix := strings.TrimPrefix(pattern, "*")
-		return strings.HasSuffix(host, suffix)
-	}
-	return false
+	return strings.HasPrefix(path, "^") || strings.ContainsAny(path, "^$.*+?[](){}|")
 }
 
 // pathMatches returns true if requestPath matches configured paths for the given action.
-// Supports: (1) regex patterns (if path starts with ^),
+// Supports: (1) regex patterns (if path starts with ^ or contains regex metacharacters),
 //
-//	(2) glob wildcard paths using '*' (preferred over regex unless '^' is used),
-//	(3) placeholder patterns like /api/org/{id}/completion,
-//	(4) literal paths, (5) prefix matching for non-record action.
+//	(2) placeholder patterns like /api/org/{id}/completion,
+//	(3) literal paths, (4) prefix matching for non-record action.
 func pathMatches(requestPath string, paths []string, action string) bool {
 	if len(paths) == 0 {
 		return true
 	}
-	normReq := normalizePath(requestPath)
+	normReq := requestPath
+	if !strings.HasPrefix(normReq, "/") {
+		normReq = "/" + normReq
+	}
+	normReq = strings.TrimSuffix(normReq, "/") + "/"
 	for _, configuredPath := range paths {
-		normPath := normalizePath(configuredPath)
-
-		// Prefer simple glob wildcard matching for patterns like "/api/*" or "/api/v0/chat/*".
-		// To force true regex behavior (including '*' quantifiers), prefix pattern with '^'.
-		if strings.Contains(configuredPath, "*") && !strings.HasPrefix(strings.TrimSpace(configuredPath), "^") {
-			reStr := globToRegex(normPath)
-			re, err := regexp.Compile(reStr)
-			if err != nil {
-				logging.Logger.Warn(fmt.Sprintf("Invalid glob pattern '%s' -> regex '%s': %v", configuredPath, reStr, err))
-				continue
-			}
-			if re.MatchString(normReq) || re.MatchString(strings.TrimSuffix(normReq, "/")) {
-				return true
-			}
-			continue
+		normPath := configuredPath
+		if !strings.HasPrefix(normPath, "/") {
+			normPath = "/" + normPath
 		}
+		normPath = strings.TrimSuffix(normPath, "/") + "/"
 
-		// Try regex match (if path looks like a regex pattern)
+		// Try regex match first (if path looks like a regex pattern)
 		if isRegexPattern(configuredPath) {
 			re, err := regexp.Compile(configuredPath)
 			if err != nil {
@@ -369,17 +286,17 @@ func (um *URLMatcher) MatchURL(requestURL, tenantID, httpMethod string) (*URLCon
 		candidates = append(candidates, um.cache[altBaseURL]...)
 	}
 	if len(candidates) == 0 {
-		requestHost := parsedURL.Hostname()
-		for key, eps := range um.cache {
-			if !strings.Contains(key, "*") {
+		allBases := make([]string, 0, len(um.cache))
+		for key := range um.cache {
+			allBases = append(allBases, key)
+		}
+		for _, key := range allBases {
+			if !strings.Contains(key, "*.") {
 				continue
 			}
-			patternHost := strings.TrimSpace(key)
-			if u, err2 := url.Parse(patternHost); err2 == nil && u.Host != "" {
-				patternHost = u.Hostname()
-			}
-			if hostMatchesWildcard(requestHost, patternHost) {
-				candidates = append(candidates, eps...)
+			wild := strings.Replace(key, "*.", "", 1)
+			if strings.HasSuffix(baseURL, wild) || (altBaseURL != "" && strings.HasSuffix(altBaseURL, wild)) {
+				candidates = append(candidates, um.cache[key]...)
 			}
 		}
 	}

@@ -30,7 +30,6 @@ import (
 type BusinessLogicHandler struct {
 	tenantValidator    *TenantValidator
 	identityExtractor  *IdentityExtractor
-	ldapEnricher       *LDAPEnricher
 	urlMatcher         *URLMatcher
 	sqsClient          *SQSClient
 	s3Client           *s3.S3
@@ -44,13 +43,7 @@ type BusinessLogicHandler struct {
 func NewBusinessLogicHandler(db *sql.DB, sqsQueueURL, sqsRegion, sqsAccessKeyID, sqsSecretAccessKey, s3Bucket string) (*BusinessLogicHandler, error) {
 	tenantValidator := NewTenantValidator(db)
 	identityExtractor := NewIdentityExtractor()
-	ldapEnricher := NewLDAPEnricher()
 	urlMatcher := NewURLMatcher(db)
-	if ldapEnricher.Enabled() {
-		logging.Logger.Info("LDAP ENRICHER: enabled — will fetch AD attributes (name, email, department) per request")
-	} else {
-		logging.Logger.Warn("LDAP ENRICHER: disabled — set LDAP_HOST, LDAP_BASE_DN, LDAP_BIND_DN, LDAP_BIND_PASSWORD to enable AD attribute enrichment")
-	}
 
 	var sqsClient *SQSClient
 	var err error
@@ -84,10 +77,9 @@ func NewBusinessLogicHandler(db *sql.DB, sqsQueueURL, sqsRegion, sqsAccessKeyID,
 	}
 
 	return &BusinessLogicHandler{
-		tenantValidator:    tenantValidator,
-		identityExtractor:  identityExtractor,
-		ldapEnricher:       ldapEnricher,
-		urlMatcher:         urlMatcher,
+		tenantValidator:   tenantValidator,
+		identityExtractor: identityExtractor,
+		urlMatcher:        urlMatcher,
 		sqsClient:          sqsClient,
 		s3Client:           s3Client,
 		s3Bucket:           s3Bucket,
@@ -228,20 +220,23 @@ func (blh *BusinessLogicHandler) ProcessRequest(
 		}
 	}
 
-	// Enrich identity with AD attributes (displayName, email, department) via LDAP search.
-	if identity != nil && identity.UserID != "" {
-		if adAttrs, enrichErr := blh.ldapEnricher.FetchAttributes(identity.UserID); enrichErr != nil {
-			logging.Logger.Warn(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("LDAP ENRICHER ERROR: %v", enrichErr)))
-		} else if adAttrs != nil {
-			identity.DisplayName = adAttrs.DisplayName
-			identity.GivenName = adAttrs.GivenName
-			identity.Email = adAttrs.Email
-			identity.Department = adAttrs.Department
-			logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
-				"AD IDENTITY: username=%s name=%q email=%q department=%q",
-				identity.UserID, identity.DisplayName, identity.Email, identity.Department,
-			)))
+	// Collect all X-Client-* headers injected by G3 proxy after LDAP bind.
+	// G3 injects AD attributes at the ICAP level (not into the encapsulated HTTP request),
+	// so we must scan both maps. ICAP headers take priority on collision.
+	userAttributes := make(map[string]string)
+	for _, headerMap := range []http.Header{httpHeaderMap, icapHeaderMap} {
+		for key, vals := range headerMap {
+			if strings.HasPrefix(strings.ToLower(key), "x-client-") && len(vals) > 0 && vals[0] != "" {
+				attrKey := strings.ToLower(strings.TrimPrefix(strings.ToLower(key), "x-client-"))
+				attrKey = strings.ReplaceAll(attrKey, "-", "_")
+				userAttributes[attrKey] = vals[0]
+			}
 		}
+	}
+	if len(userAttributes) > 0 {
+		logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
+			"CLIENT IDENTITY: username=%s attributes=%v", identity.UserID, userAttributes,
+		)))
 	}
 
 	// Validate tenant and user
@@ -319,7 +314,7 @@ func (blh *BusinessLogicHandler) ProcessRequest(
 				httpRequest.Body = io.NopCloser(bytes.NewBuffer(bodySnapshot))
 			}
 			logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("ICAP RECORD ACTION: Starting background processing for URL '%s' (action=%s, flow=%s)", requestURL, action, flow)))
-			go blh.processRecordAction(httpRequest, bodySnapshot, identity, urlConfig, xICAPMetadata)
+			go blh.processRecordAction(httpRequest, bodySnapshot, identity, userAttributes, urlConfig, xICAPMetadata)
 			return utils.NoModificationStatusCodeStr, false, nil
 		case "redact", "smart", "blind_redact":
 			logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("redact action '%s' passthrough for url='%s'", action, requestURL)))
@@ -337,6 +332,7 @@ func (blh *BusinessLogicHandler) processRecordAction(
 	httpRequest *http.Request,
 	bodyBytes []byte,
 	identity *IdentityInfo,
+	userAttributes map[string]string,
 	urlConfig *URLConfig,
 	xICAPMetadata string,
 ) {
@@ -384,9 +380,7 @@ func (blh *BusinessLogicHandler) processRecordAction(
 		Method:           method,
 		UserID:           identity.UserID,
 		Username:         identity.Username,
-		DisplayName:      identity.DisplayName,
-		Email:            identity.Email,
-		Department:       identity.Department,
+		UserAttributes:   userAttributes,
 		TenantID:         identity.TenantID,
 		RegionCode:       regionCode,
 		SessionID:        sessionID,
