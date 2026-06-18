@@ -233,7 +233,7 @@ func (blh *BusinessLogicHandler) ProcessRequest(
 			userAttributes = attrs
 		}
 	}
-	logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
+	logging.Logger.Debug(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
 		"CLIENT IDENTITY: username=%s attributes=%v", identity.UserID, userAttributes,
 	)))
 

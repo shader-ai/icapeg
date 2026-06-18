@@ -2,6 +2,7 @@ package business
 
 import (
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -82,7 +83,7 @@ func (e *LDAPEnricher) Enrich(username string) (map[string]string, error) {
 
 func (e *LDAPEnricher) searchAD(username string) (map[string]string, error) {
 	addr := fmt.Sprintf("%s:%s", e.host, e.port)
-	conn, err := ldap.Dial("tcp", addr)
+	conn, err := ldap.DialURL("ldap://"+addr, ldap.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}))
 	if err != nil {
 		return nil, fmt.Errorf("ldap dial %s: %w", addr, err)
 	}
