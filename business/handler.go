@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,6 +32,7 @@ type BusinessLogicHandler struct {
 	tenantValidator    *TenantValidator
 	identityExtractor  *IdentityExtractor
 	urlMatcher         *URLMatcher
+	candidateLogger    *CandidateLogger
 	sqsClient          *SQSClient
 	s3Client           *s3.S3
 	s3Bucket           string
@@ -45,6 +47,7 @@ func NewBusinessLogicHandler(db *sql.DB, sqsQueueURL, sqsRegion, sqsAccessKeyID,
 	tenantValidator := NewTenantValidator(db)
 	identityExtractor := NewIdentityExtractor()
 	urlMatcher := NewURLMatcher(db)
+	candidateLogger := NewCandidateLogger(db)
 
 	var sqsClient *SQSClient
 	var err error
@@ -81,6 +84,7 @@ func NewBusinessLogicHandler(db *sql.DB, sqsQueueURL, sqsRegion, sqsAccessKeyID,
 		tenantValidator:    tenantValidator,
 		identityExtractor:  identityExtractor,
 		urlMatcher:         urlMatcher,
+		candidateLogger:    candidateLogger,
 		sqsClient:          sqsClient,
 		s3Client:           s3Client,
 		s3Bucket:           s3Bucket,
@@ -277,7 +281,23 @@ func (blh *BusinessLogicHandler) ProcessRequest(
 		// Continue processing even if URL matching fails
 	}
 
-	if urlConfig != nil {
+	if urlConfig == nil {
+		// No catalog match — observe domain for candidate discovery.
+		if blh.candidateLogger != nil {
+			var ct string
+			if httpRequest != nil {
+				ct = httpRequest.Header.Get("Content-Type")
+			}
+			var host string
+			if parsedHost, err2 := url.Parse(requestURL); err2 == nil {
+				host = strings.ToLower(parsedHost.Host)
+			}
+			blh.candidateLogger.Observe(host, httpMethod, ct)
+		}
+		return utils.NoModificationStatusCodeStr, false, nil
+	}
+
+	{
 		action := strings.ToLower(urlConfig.Action)
 		flow := strings.ToLower(urlConfig.Flow)
 
@@ -386,36 +406,44 @@ func (blh *BusinessLogicHandler) processRecordAction(
 		ToolID:           urlConfig.ToolID,
 		IsToolSanctioned: urlConfig.IsToolSanctioned,
 		EndpointID:       urlConfig.ID,
+		IsWildcard:       urlConfig.IsWildcard,
 		Timestamp:        time.Now().UTC().Format(time.RFC3339),
 	}
 	if len(urlConfig.ContentPaths) > 0 {
 		recordingReq.ContentPaths = append(json.RawMessage(nil), urlConfig.ContentPaths...)
 	}
 
-	// Detect multipart file upload: extract file, upload to S3, attach key to SQS message.
-	// Use a deterministic record ID derived from the SQS MessageId (same logic as backend).
-	contentTypeHdr := ""
-	if httpRequest != nil {
-		contentTypeHdr = httpRequest.Header.Get("Content-Type")
-	}
-	if files := blh.uploadFilesToS3(
-		identity.TenantID,
-		fmt.Sprintf("%d", time.Now().UnixNano()), // proxy record ID — backend derives its own from SQS MessageId
-		bodyBytes,
-		contentTypeHdr,
-		xICAPMetadata,
-	); len(files) > 0 {
-		recordingReq.Files = files
-		// Mirror the first attachment into the legacy single fields for backward compatibility.
-		first := files[0]
-		recordingReq.FileS3Key = first.FileS3Key
-		recordingReq.FileName = first.FileName
-		recordingReq.FileContentType = first.FileContentType
-		recordingReq.FileSize = first.FileSize
-		recordingReq.FileSHA256 = first.FileSHA256
-		recordingReq.HasFileAttachment = true
-		// Don't send the raw binary body for file uploads — it's already in S3.
+	// Wildcard endpoints are discovery catch-alls: store metadata only, no body or files.
+	if urlConfig.IsWildcard {
 		recordingReq.Body = ""
+		logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf(
+			"ICAP WILDCARD RECORD: metadata-only for URL '%s'", requestURL)))
+	} else {
+		// Detect multipart file upload: extract file, upload to S3, attach key to SQS message.
+		// Use a deterministic record ID derived from the SQS MessageId (same logic as backend).
+		contentTypeHdr := ""
+		if httpRequest != nil {
+			contentTypeHdr = httpRequest.Header.Get("Content-Type")
+		}
+		if files := blh.uploadFilesToS3(
+			identity.TenantID,
+			fmt.Sprintf("%d", time.Now().UnixNano()), // proxy record ID — backend derives its own from SQS MessageId
+			bodyBytes,
+			contentTypeHdr,
+			xICAPMetadata,
+		); len(files) > 0 {
+			recordingReq.Files = files
+			// Mirror the first attachment into the legacy single fields for backward compatibility.
+			first := files[0]
+			recordingReq.FileS3Key = first.FileS3Key
+			recordingReq.FileName = first.FileName
+			recordingReq.FileContentType = first.FileContentType
+			recordingReq.FileSize = first.FileSize
+			recordingReq.FileSHA256 = first.FileSHA256
+			recordingReq.HasFileAttachment = true
+			// Don't send the raw binary body for file uploads — it's already in S3.
+			recordingReq.Body = ""
+		}
 	}
 
 	logging.Logger.Info(utils.PrepareLogMsg(xICAPMetadata, fmt.Sprintf("ICAP PREPARING SQS MESSAGE: URL='%s', Method='%s', TenantID='%s', UserID='%s', RegionCode='%s', ToolID='%s', BodySize=%d bytes",

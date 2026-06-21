@@ -61,6 +61,9 @@ type RecordingRequest struct {
 	EndpointID       string            `json:"endpoint_id,omitempty"`
 	ContentPaths     json.RawMessage   `json:"content_paths,omitempty"`
 	Timestamp        string            `json:"timestamp"`
+	// IsWildcard signals that the matched endpoint is a discovery catch-all.
+	// The recording worker stores metadata-only (no body, no confidentiality pipeline).
+	IsWildcard       bool   `json:"is_wildcard,omitempty"`
 	// File attachment fields — populated when the intercepted request is a multipart file upload.
 	FileS3Key        string `json:"file_s3_key,omitempty"`
 	FileName         string `json:"file_name,omitempty"`

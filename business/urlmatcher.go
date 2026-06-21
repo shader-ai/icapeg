@@ -29,6 +29,7 @@ type CachedEndpoint struct {
 	Paths        []string
 	BaseURL      string
 	ContentPaths []byte // JSON from ai_tool_endpoints.content_paths; nil if NULL
+	IsWildcard   bool   // true = discovery-created catch-all; metadata-only recording
 }
 
 // methodMatches returns true if the live request verb matches the catalog row.
@@ -55,14 +56,15 @@ type URLMatcher struct {
 
 // URLConfig contains URL configuration data (passed to processRecordAction and into SQS for the recording worker).
 type URLConfig struct {
-	Name           string
-	Action         string
-	Flow           string
-	Paths          []string
-	ID             string // endpoint_id
-	ToolID         string // ai_tools.tool_id (UUID) so recording worker can associate request with tool
-	IsToolSanctioned *bool // tenant_ai_tools.is_sanctioned at request time (nil if no row = default false)
-	ContentPaths   []byte // JSON for prompt extraction in recording worker; nil if NULL
+	Name             string
+	Action           string
+	Flow             string
+	Paths            []string
+	ID               string // endpoint_id
+	ToolID           string // ai_tools.tool_id (UUID) so recording worker can associate request with tool
+	IsToolSanctioned *bool  // tenant_ai_tools.is_sanctioned at request time (nil if no row = default false)
+	ContentPaths     []byte // JSON for prompt extraction in recording worker; nil if NULL
+	IsWildcard       bool   // true = discovery wildcard; recording worker stores metadata-only
 }
 
 // NewURLMatcher creates a new URL matcher and loads the endpoint cache from the database.
@@ -81,7 +83,7 @@ func (um *URLMatcher) RefreshEndpointsCache() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	query := `
-		SELECT 
+		SELECT
 			ate.endpoint_id::text,
 			ate.tool_id::text,
 			ate.name,
@@ -91,7 +93,8 @@ func (um *URLMatcher) RefreshEndpointsCache() {
 			ate.endpoint_path,
 			ate.domain,
 			ate.protocol,
-			ate.content_paths
+			ate.content_paths,
+			ate.is_wildcard
 		FROM ai_tool_endpoints ate
 		WHERE ate.is_active = true
 			AND ate.flow IN ('egress', 'both')
@@ -108,7 +111,8 @@ func (um *URLMatcher) RefreshEndpointsCache() {
 	for rows.Next() {
 		var epID, toolID, name, action, flow, httpMethod, endpointPath, domain, protocol string
 		var contentPaths []byte
-		if err := rows.Scan(&epID, &toolID, &name, &action, &flow, &httpMethod, &endpointPath, &domain, &protocol, &contentPaths); err != nil {
+		var isWildcard bool
+		if err := rows.Scan(&epID, &toolID, &name, &action, &flow, &httpMethod, &endpointPath, &domain, &protocol, &contentPaths, &isWildcard); err != nil {
 			logging.Logger.Warn(fmt.Sprintf("ICAP ENDPOINT CACHE: skip row: %v", err))
 			continue
 		}
@@ -129,6 +133,7 @@ func (um *URLMatcher) RefreshEndpointsCache() {
 			Paths:        paths,
 			BaseURL:      baseURL,
 			ContentPaths: append([]byte(nil), contentPaths...),
+			IsWildcard:   isWildcard,
 		}
 		newCache[baseURL] = append(newCache[baseURL], entry)
 	}
@@ -326,7 +331,7 @@ func (um *URLMatcher) MatchURL(requestURL, tenantID, httpMethod string) (*URLCon
 		return nil, err
 	}
 
-	logging.Logger.Info(fmt.Sprintf("ICAP URL MATCH FOUND: '%s' -> rule='%s' (action=%s, flow=%s, tool_id=%s, is_sanctioned=%v)", requestURL, matched.Name, matched.Action, matched.Flow, matched.ToolID, isSanctioned))
+	logging.Logger.Info(fmt.Sprintf("ICAP URL MATCH FOUND: '%s' -> rule='%s' (action=%s, flow=%s, tool_id=%s, is_sanctioned=%v, is_wildcard=%v)", requestURL, matched.Name, matched.Action, matched.Flow, matched.ToolID, isSanctioned, matched.IsWildcard))
 	return &URLConfig{
 		Name:             matched.Name,
 		Action:           matched.Action,
@@ -336,5 +341,6 @@ func (um *URLMatcher) MatchURL(requestURL, tenantID, httpMethod string) (*URLCon
 		ToolID:           matched.ToolID,
 		IsToolSanctioned: isSanctioned,
 		ContentPaths:     append([]byte(nil), matched.ContentPaths...),
+		IsWildcard:       matched.IsWildcard,
 	}, nil
 }

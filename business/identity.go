@@ -1,15 +1,95 @@
 package business
 
 import (
+	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"icapeg/logging"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
+
+// WhoisResult is the identity resolved for a WireGuard inner IP.
+type WhoisResult struct {
+	User     string `json:"user"`
+	Subject  string `json:"subject"`
+	Role     string `json:"role"`
+	TenantID string `json:"tenant_id"`
+}
+
+type whoisEntry struct {
+	result *WhoisResult
+	expiry time.Time
+}
+
+var (
+	whoisCacheMu sync.Mutex
+	whoisCache   = make(map[string]*whoisEntry)
+)
+
+func lookupWhois(ctx context.Context, innerIP string, ts time.Time) (*WhoisResult, error) {
+	backendURL := strings.TrimRight(os.Getenv("URAI_BACKEND_URL"), "/")
+	whoisToken := os.Getenv("URAI_WHOIS_TOKEN")
+	if backendURL == "" || whoisToken == "" {
+		return nil, fmt.Errorf("identity: URAI_BACKEND_URL or URAI_WHOIS_TOKEN not configured")
+	}
+
+	bucket := ts.Unix() / 5
+	cacheKey := fmt.Sprintf("%s:%d", innerIP, bucket)
+
+	whoisCacheMu.Lock()
+	if entry, ok := whoisCache[cacheKey]; ok && time.Now().Before(entry.expiry) {
+		whoisCacheMu.Unlock()
+		return entry.result, nil
+	}
+	whoisCacheMu.Unlock()
+
+	tsStr := ts.UTC().Format(time.RFC3339)
+	reqURL := fmt.Sprintf("%s/api/v1/tunnel/whois?ip=%s&ts=%s",
+		backendURL, url.QueryEscape(innerIP), url.QueryEscape(tsStr))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("identity: whois request build: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+whoisToken)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("identity: whois request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// No active lease — cache the miss too
+		whoisCacheMu.Lock()
+		whoisCache[cacheKey] = &whoisEntry{result: nil, expiry: time.Now().Add(5 * time.Second)}
+		whoisCacheMu.Unlock()
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("identity: whois returned HTTP %d", resp.StatusCode)
+	}
+
+	var result WhoisResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("identity: whois decode: %w", err)
+	}
+
+	whoisCacheMu.Lock()
+	whoisCache[cacheKey] = &whoisEntry{result: &result, expiry: time.Now().Add(5 * time.Second)}
+	whoisCacheMu.Unlock()
+	return &result, nil
+}
 
 // IdentityExtractor extracts tenant ID, user ID, and source IP from headers and environment.
 // Tenant ID is read from the TENANT_ID environment variable (e.g. set in .env or deployment).
@@ -35,6 +115,11 @@ func (ie *IdentityExtractor) ExtractIdentity(icapHeaders, httpHeaders http.Heade
 	// Tenant ID is configured on the ICAP server via environment (e.g. .env or TENANT_ID).
 	info.TenantID = strings.TrimSpace(os.Getenv("TENANT_ID"))
 
+	// Strip client-supplied identity headers; only trust them from the proxy (icapHeaders).
+	httpHeaders.Del("X-Client-Username")
+	httpHeaders.Del("X-Authenticated-User")
+	httpHeaders.Del("X-Client-IP")
+
 	// Merge ICAP headers into HTTP headers (ICAP headers take priority)
 	mergedHeaders := make(http.Header)
 	for k, v := range httpHeaders {
@@ -42,6 +127,33 @@ func (ie *IdentityExtractor) ExtractIdentity(icapHeaders, httpHeaders http.Heade
 	}
 	for k, v := range icapHeaders {
 		mergedHeaders[k] = v
+	}
+
+	// Resolve identity from WireGuard tunnel inner IP (takes priority over proxy-auth headers).
+	if clientIP := mergedHeaders.Get("X-Client-IP"); clientIP != "" {
+		whoisCtx, whoisCancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer whoisCancel()
+		whoisResult, err := lookupWhois(whoisCtx, clientIP, time.Now())
+		if err != nil {
+			// When the tunnel path is enforced, a whois error must block the request —
+			// no identity = no attribution, which violates the network-enforced guarantee.
+			if os.Getenv("URAI_TUNNEL_ENFORCED") == "true" {
+				return nil, fmt.Errorf("identity: whois lookup failed for %s on enforced tunnel path: %w", clientIP, err)
+			}
+			logging.Logger.Warn(fmt.Sprintf("whois lookup failed for IP %s: %v — falling back to header identity", clientIP, err))
+			// Fall through to legacy header resolution on transient error (non-enforced path).
+		} else if whoisResult == nil {
+			// Hard-block: no active lease for this inner IP.
+			return nil, fmt.Errorf("identity: no active lease for inner IP %s — request blocked", clientIP)
+		} else {
+			info.UserID = whoisResult.User
+			info.Username = whoisResult.User
+			info.SourceIP = clientIP
+			if whoisResult.TenantID != "" {
+				info.TenantID = whoisResult.TenantID
+			}
+			return info, nil
+		}
 	}
 
 	// G3 proxy authentication headers take priority — the proxy username is the
@@ -56,8 +168,7 @@ func (ie *IdentityExtractor) ExtractIdentity(icapHeaders, httpHeaders http.Heade
 		decoded, err := base64.StdEncoding.DecodeString(authUser)
 		if err == nil {
 			decodedStr := string(decoded)
-			if strings.HasPrefix(decodedStr, "Local://") {
-				userID := strings.TrimPrefix(decodedStr, "Local://")
+			if userID, ok := strings.CutPrefix(decodedStr, "Local://"); ok {
 				if info.UserID == "" {
 					info.UserID = userID
 				}
